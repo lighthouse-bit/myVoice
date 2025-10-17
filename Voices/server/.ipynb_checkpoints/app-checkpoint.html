@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>XTTS v2 MVP</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.5rem; margin: 0 0 1rem; }
+    textarea { width: 100%; height: 120px; }
+    .row { margin: 0.5rem 0; display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+    button { padding: 0.5rem 1rem; }
+    label { font-weight: 600; }
+    .small { font-size: 0.9rem; opacity: 0.8; }
+    #status, #recStatus, #health { min-height: 1.25rem; display: inline-block; }
+    #player, #refPlayer { width: 100%; margin-top: 0.5rem; }
+    .grow { flex: 1; }
+  </style>
+</head>
+<body>
+  <h1>XTTS v2 MVP</h1>
+
+  <div class="row">
+    <textarea id="text">Hello! This is the XTTS MVP speaking.</textarea>
+  </div>
+
+  <div class="row">
+    <label for="lang">Language:</label>
+    <select id="lang">
+      <option value="en" selected>English</option>
+      <option value="es">Spanish</option>
+      <option value="fr">French</option>
+      <option value="de">German</option>
+      <option value="it">Italian</option>
+      <option value="pt">Portuguese</option>
+      <option value="pl">Polish</option>
+      <option value="hi">Hindi</option>
+      <option value="zh">Chinese</option>
+      <option value="ja">Japanese</option>
+      <option value="ko">Korean</option>
+    </select>
+
+    <label for="speed">Speed:</label>
+    <input type="number" id="speed" value="1.0" step="0.1" min="0.5" max="2.0" />
+  </div>
+
+  <div class="row">
+    <label for="voice">Voice file:</label>
+    <input type="file" id="voice" accept="audio/*" />
+    <span class="small">(or record below)</span>
+    <span id="savedVoice" class="small"></span>
+  </div>
+
+  <div class="row">
+    <button id="recBtn">Record</button>
+    <button id="stopBtn" disabled>Stop</button>
+    <button id="clearVoiceBtn" class="small">Clear saved voice</button>
+    <span id="recStatus" class="small"></span>
+    <div class="grow"></div>
+  </div>
+  <audio id="refPlayer" controls preload="auto"></audio>
+
+  <div class="row" style="margin-top:1rem;">
+    <button id="restBtn">Speak (REST)</button>
+    <button id="wsBtn">Speak (WebSocket)</button>
+    <span id="status"></span>
+  </div>
+
+  <audio id="player" controls preload="auto"></audio>
+  <div class="row">
+    <a id="downloadLink" href="#" download="tts.wav" class="small">Download last audio</a>
+  </div>
+
+  <div class="row">
+    <span id="health" class="small"></span>
+  </div>
+
+  <script>
+    const apiBase = 'http://127.0.0.1:8000';
+
+    const textEl = document.getElementById('text');
+    const langEl = document.getElementById('lang');
+    const speedEl = document.getElementById('speed');
+    const voiceEl = document.getElementById('voice');
+    const statusEl = document.getElementById('status');
+    const recStatusEl = document.getElementById('recStatus');
+    const healthEl = document.getElementById('health');
+    const player = document.getElementById('player');
+    const refPlayer = document.getElementById('refPlayer');
+    const savedVoiceEl = document.getElementById('savedVoice');
+    const downloadLink = document.getElementById('downloadLink');
+
+    let recordedBlob = null;
+    let storedVoiceId = localStorage.getItem('voice_id') || null;
+    let lastAudioUrl = null;
+
+    function updateSavedVoiceLabel() {
+      savedVoiceEl.textContent = storedVoiceId ? `(saved voice_id: ${storedVoiceId})` : '';
+    }
+    updateSavedVoiceLabel();
+
+    function setAudioFromBlob(blob, contentType = 'audio/wav') {
+      try { if (lastAudioUrl) URL.revokeObjectURL(lastAudioUrl); } catch {}
+      const typedBlob = blob.type ? blob : new Blob([blob], { type: contentType || 'audio/wav' });
+      const url = URL.createObjectURL(typedBlob);
+      lastAudioUrl = url;
+
+      player.src = url;
+      player.load();
+      downloadLink.href = url;
+
+      const kb = (typedBlob.size / 1024).toFixed(1);
+      statusEl.textContent = `Loaded ${kb} KB — waiting metadata...`;
+
+      player.onloadedmetadata = () => {
+        const dur = isFinite(player.duration) ? `${player.duration.toFixed(2)}s` : 'unknown';
+        statusEl.textContent = `Ready — duration: ${dur}, size: ${kb} KB`;
+      };
+      player.onerror = (e) => {
+        statusEl.textContent = 'Audio element failed to load the WAV';
+        console.error('Audio error', e, typedBlob);
+      };
+      player.play().catch(err => {
+        // Autoplay can be blocked; user can press play manually.
+        console.log('Autoplay blocked or failed:', err);
+      });
+    }
+
+    // ----- Recording to WAV (mono) -----
+    let audioContext, mediaStream, source, processor, recChunks = [];
+    async function startRecording() {
+      recordedBlob = null;
+      recChunks = [];
+      recStatusEl.textContent = 'requesting microphone...';
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStream = stream;
+      audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      source = audioContext.createMediaStreamSource(stream);
+      processor = audioContext.createScriptProcessor(4096, 1, 1);
+      source.connect(processor);
+      processor.connect(audioContext.destination);
+      processor.onaudioprocess = (e) => {
+        const input = e.inputBuffer.getChannelData(0);
+        recChunks.push(new Float32Array(input));
+      };
+      recStatusEl.textContent = 'recording... speak for ~5–15 seconds';
+    }
+    function stopRecording() {
+      if (!processor) return;
+      processor.disconnect();
+      source.disconnect();
+      if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+      // Merge Float32 chunks
+      let length = 0;
+      recChunks.forEach(c => length += c.length);
+      const samples = new Float32Array(length);
+      let offset = 0;
+      recChunks.forEach(c => { samples.set(c, offset); offset += c.length; });
+      const wavBuffer = encodeWAV(samples, audioContext.sampleRate);
+      recordedBlob = new Blob([wavBuffer], { type: 'audio/wav' });
+      refPlayer.src = URL.createObjectURL(recordedBlob);
+      refPlayer.load();
+      recStatusEl.textContent = 'recorded ✓';
+    }
+    function encodeWAV(samples, sampleRate) {
+      const bytesPerSample = 2, numChannels = 1, blockAlign = numChannels * bytesPerSample;
+      const buffer = new ArrayBuffer(44 + samples.length * bytesPerSample);
+      const view = new DataView(buffer);
+      writeStr(view, 0, 'RIFF');
+      view.setUint32(4, 36 + samples.length * bytesPerSample, true);
+      writeStr(view, 8, 'WAVE');
+      writeStr(view, 12, 'fmt ');
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, numChannels, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, sampleRate * blockAlign, true);
+      view.setUint16(32, blockAlign, true);
+      view.setUint16(34, 16, true);
+      writeStr(view, 36, 'data');
+      view.setUint32(40, samples.length * bytesPerSample, true);
+      let offset = 44;
+      for (let i = 0; i < samples.length; i++, offset += 2) {
+        let s = Math.max(-1, Math.min(1, samples[i]));
+        view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      }
+      return buffer;
+    }
+    function writeStr(view, offset, str) {
+      for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+    }
+
+    document.getElementById('recBtn').onclick = async () => {
+      document.getElementById('recBtn').disabled = true;
+      document.getElementById('stopBtn').disabled = false;
+      try { await startRecording(); } catch (e) { recStatusEl.textContent = 'mic error: ' + e; }
+    };
+    document.getElementById('stopBtn').onclick = () => {
+      document.getElementById('recBtn').disabled = false;
+      document.getElementById('stopBtn').disabled = true;
+      stopRecording();
+    };
+    document.getElementById('clearVoiceBtn').onclick = () => {
+      localStorage.removeItem('voice_id');
+      storedVoiceId = null;
+      updateSavedVoiceLabel();
+      statusEl.textContent = 'Cleared saved voice.';
+    };
+
+    // ----- Helpers -----
+    function hasVoiceInput() {
+      return !!(voiceEl.files[0] || recordedBlob || storedVoiceId);
+    }
+    function requireVoice() {
+      if (!hasVoiceInput()) {
+        alert("XTTS v2 needs a reference voice. Upload a file or record one.");
+        return false;
+      }
+      return true;
+    }
+    async function uploadVoiceIfNeeded() {
+      if (storedVoiceId) return storedVoiceId;
+      const file = voiceEl.files[0] || recordedBlob;
+      if (!file) return null;
+      const fd = new FormData();
+      fd.append('file', file, file.name || 'recorded.wav');
+      const res = await fetch(`${apiBase}/v1/voices/upload`, { method: 'POST', body: fd });
+      if (!res.ok) throw new Error('Upload failed: ' + res.status);
+      const j = await res.json();
+      storedVoiceId = j.voice_id;
+      localStorage.setItem('voice_id', storedVoiceId);
+      updateSavedVoiceLabel();
+      return storedVoiceId;
+    }
+
+    // ----- REST -----
+    document.getElementById('restBtn').onclick = async () => {
+      if (!requireVoice()) return;
+      try {
+        statusEl.textContent = 'Generating (REST)...';
+        const fd = new FormData();
+        fd.append('text', textEl.value);
+        fd.append('language', langEl.value);
+        fd.append('speed', speedEl.value);
+        if (voiceEl.files[0]) {
+          fd.append('speaker_wav', voiceEl.files[0]);
+        } else if (recordedBlob) {
+          fd.append('speaker_wav', recordedBlob, 'recorded.wav');
+        } else if (storedVoiceId) {
+          fd.append('voice_id', storedVoiceId);
+        }
+        const res = await fetch(`${apiBase}/v1/tts`, { method: 'POST', body: fd });
+        if (!res.ok) {
+          let msg = 'HTTP ' + res.status;
+          try { const j = await res.json(); if (j.error) msg += ' - ' + j.error; } catch {}
+          throw new Error(msg);
+        }
+        const buf = await res.arrayBuffer();
+        const type = res.headers.get('content-type') || 'audio/wav';
+        const blob = new Blob([buf], { type });
+        setAudioFromBlob(blob, type);
+      } catch (e) {
+        statusEl.textContent = 'Error: ' + e.message;
+        console.error(e);
+      }
+    };
+
+    // ----- WebSocket -----
+    document.getElementById('wsBtn').onclick = async () => {
+      if (!requireVoice()) return;
+      statusEl.textContent = 'Preparing (WS)...';
+      try {
+        let voiceIdToUse = storedVoiceId;
+        if (!voiceIdToUse && (voiceEl.files[0] || recordedBlob)) {
+          voiceIdToUse = await uploadVoiceIfNeeded();
+        }
+        const ws = new WebSocket(`ws://127.0.0.1:8000/ws/tts`);
+        ws.onopen = () => {
+          ws.send(JSON.stringify({
+            text: textEl.value,
+            language: langEl.value,
+            speed: parseFloat(speedEl.value),
+            voice_id: voiceIdToUse || null
+          }));
+          statusEl.textContent = 'Synthesizing (WS)...';
+        };
+        ws.onmessage = (ev) => {
+          try {
+            const data = JSON.parse(ev.data);
+            if (data.status === 'done' && data.audio_base64) {
+              const bytes = atob(data.audio_base64);
+              const arr = new Uint8Array(bytes.length);
+              for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+              const blob = new Blob([arr], { type: data.content_type || 'audio/wav' });
+              setAudioFromBlob(blob, data.content_type || 'audio/wav');
+              ws.close();
+            } else if (data.error) {
+              statusEl.textContent = 'Error: ' + data.error;
+              ws.close();
+            }
+          } catch (_) {}
+        };
+        ws.onerror = () => { statusEl.textContent = 'WS error'; };
+      } catch (e) {
+        statusEl.textContent = 'Error: ' + e.message;
+      }
+    };
+
+    // Health check on load
+    (async () => {
+      try {
+        const res = await fetch(`${apiBase}/health`);
+        if (res.ok) {
+          const j = await res.json();
+          healthEl.textContent = `Health OK — model: ${j.model}, device: ${j.device}`;
+        } else {
+          healthEl.textContent = 'Health check failed';
+        }
+      } catch {
+        healthEl.textContent = 'Server not reachable. Start it on 127.0.0.1:8000';
+      }
+    })();
+  </script>
+</body>
+</html>
